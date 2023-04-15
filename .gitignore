@@ -47,3 +47,6 @@ lib*.pc
 # compile commands
 compile_commands.json
 
+# clangd cache
+/.clangd
+/.cache

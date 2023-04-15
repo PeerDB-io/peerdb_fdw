@@ -35,3 +35,19 @@ jobs:
         id: build
         run: |
           make PG_CONFIG=$HOME/pg14/bin/pg_config install -j$(nproc)
+
+      - name: Package Extension
+        id: package
+        run: |
+          npm install
+          npm run main -- --pgVersion 14
+        working-directory: ${{ github.workspace }}/packaging
+
+      - name: Upload Extension
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          file: "*.deb"
+          tags: true
+          draft: true

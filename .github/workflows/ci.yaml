@@ -43,11 +43,9 @@ jobs:
           npm run main -- --pgVersion 14
         working-directory: ${{ github.workspace }}/packaging
 
-      - name: Upload Extension
-        uses: xresloader/upload-to-github-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          file: "*.deb"
-          tags: true
-          draft: true
+          files: |
+            ${{ github.workspace }}/*.deb

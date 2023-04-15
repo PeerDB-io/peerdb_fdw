@@ -11,24 +11,33 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg-version: [14]
     steps:
-      - name: Get latest commit id of PostgreSQL 14
+      - name: Add PG_VERSION to env
         run: |
-          echo "PG_COMMIT_HASH=$(git ls-remote git://git.postgresql.org/git/postgresql.git refs/heads/REL_14_STABLE | awk '{print $1}')" >> $GITHUB_ENV
+          echo "PG_VERSION=${{ matrix.pg-version }}" >> $GITHUB_ENV
+          echo "PG_SRC_DIR=$HOME/pg${{ matrix.pg-version }}" >> $GITHUB_ENV
 
-      - name: Cache PostgreSQL 14
+      - name: Get latest commit id of PostgreSQL ${{ env.PG_VERSION }}
+        run: |
+          echo "PG_COMMIT_HASH=$(git ls-remote git://git.postgresql.org/git/postgresql.git refs/heads/REL_${PG_VERSION}_STABLE | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Cache PostgreSQL ${{ env.PG_VERSION }}
         uses: actions/cache@v3
-        id: pg14cache
+        id: pg-source-cache
         with:
-          path: ~/pg14
-          key: ${{ runner.os }}-v1-pg14-${{ env.PG_COMMIT_HASH }}
+          path: ${{ env.PG_SRC_DIR }}
+          key: ${{ runner.os }}-v2-pg-${{ env.PG_COMMIT_HASH }}
 
-      - name: Install PostgreSQL 14
-        if: steps.pg14cache.outputs.cache-hit != 'true'
+      - name: Install PostgreSQL ${{ env.PG_VERSION }}
+        if: steps.pg-source-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch REL_14_STABLE git://git.postgresql.org/git/postgresql.git ~/pg14source
-          cd ~/pg14source
-          ./configure --prefix=$HOME/pg14 CFLAGS="-std=gnu99 -ggdb -O0" --enable-cassert
+          git clone --depth 1 --branch REL_${PG_VERSION}_STABLE git://git.postgresql.org/git/postgresql.git $PG_SRC_DIR
+          cd $PG_SRC_DIR
+          ./configure --prefix=$PG_SRC_DIR CFLAGS="-std=gnu99 -ggdb -O0" --enable-cassert
           make install -j$(nproc) > /dev/null
 
       - uses: actions/checkout@v3
@@ -36,13 +45,13 @@ jobs:
       - name: Build
         id: build
         run: |
-          make PG_CONFIG=$HOME/pg14/bin/pg_config install -j$(nproc)
+          make PG_CONFIG=$PG_SRC_DIR/bin/pg_config install -j$(nproc)
 
       - name: Package Extension
         id: package
         run: |
           npm install
-          npm run main -- --pgVersion 14
+          npm run main -- --pgVersion $PG_VERSION
         working-directory: ${{ github.workspace }}/packaging
 
       - name: Upload Release Asset

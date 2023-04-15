@@ -21,7 +21,8 @@ console.log(`Temporary working directory: ${tmpDir}`)
 
 // within the temporary working directory, we create a directory called
 // 'postgresql-$pgVersion-peerdb'
-let pgDir = `${tmpDir}/postgresql-${pgVersion}-peerdb`
+let extName = `postgresql-${pgVersion}-peerdb-fdw`
+let pgDir = `${tmpDir}/${extName}`
 await $`mkdir ${pgDir}`
 cd(pgDir)
 
@@ -48,7 +49,7 @@ await $`mkdir ${debFolder}`
 // create the control file
 let controlFile = `${debFolder}/control`
 await $`touch ${controlFile}`
-await $`echo "Package: postgresql-${pgVersion}-peerdb" >> ${controlFile}`
+await $`echo "Package: ${extName}" >> ${controlFile}`
 await $`echo "Version: 1.2" >> ${controlFile}`
 await $`echo "Section: base" >> ${controlFile}`
 await $`echo "Priority: optional" >> ${controlFile}`

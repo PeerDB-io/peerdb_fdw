@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get latest commit id of PostgreSQL 14
+        run: |
+          echo "PG_COMMIT_HASH=$(git ls-remote git://git.postgresql.org/git/postgresql.git refs/heads/REL_14_STABLE | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Cache PostgreSQL 14
+        uses: actions/cache@v3
+        id: pg14cache
+        with:
+          path: ~/pg14
+          key: ${{ runner.os }}-v1-pg14-${{ env.PG_COMMIT_HASH }}
+
+      - name: Install PostgreSQL 14
+        if: steps.pg14cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch REL_14_STABLE git://git.postgresql.org/git/postgresql.git ~/pg14source
+          cd ~/pg14source
+          ./configure --prefix=$HOME/pg14 CFLAGS="-std=gnu99 -ggdb -O0" --enable-cassert
+          make install -j$(nproc) > /dev/null
+
+      - uses: actions/checkout@v3
+
+      - name: Build
+        id: build
+        run: |
+          make PG_CONFIG=$HOME/pg14/bin/pg_config install -j$(nproc)

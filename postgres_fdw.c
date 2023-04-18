@@ -62,9 +62,6 @@ PG_MODULE_MAGIC;
 /* If no remote estimates, assume a sort costs 20% extra */
 #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
 
-/* bigquery sort multiplier. See: https://github.com/PeerDB-io/nexus/issues/264 */
-#define BIGQUERY_FDW_SORT_MULTIPLIER 0.8
-
 /*
  * Indexes of FDW-private information stored in fdw_private lists.
  *
@@ -3479,7 +3476,7 @@ estimate_path_cost_size(PlannerInfo *root,
 			else
 			{
 				startup_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
-				run_cost *= BIGQUERY_FDW_SORT_MULTIPLIER;
+				run_cost *= DEFAULT_FDW_SORT_MULTIPLIER;
 			}
 		}
 
@@ -3566,7 +3563,7 @@ estimate_path_cost_size(PlannerInfo *root,
 	}
 
 	/* Return results. */
-	*p_rows = rows;
+	*p_rows = 1000;
 	*p_width = width;
 	*p_startup_cost = startup_cost;
 	*p_total_cost = total_cost;

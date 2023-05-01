@@ -60,7 +60,8 @@ PG_MODULE_MAGIC;
 #define DEFAULT_FDW_TUPLE_COST		0.01
 
 /* If no remote estimates, assume a sort costs 20% extra */
-#define DEFAULT_FDW_SORT_MULTIPLIER 1.2
+/* If no remote estimates, assume a sort costs as negligible to push down every ORDER BY.*/
+#define DEFAULT_FDW_SORT_MULTIPLIER 1.01
 
 /*
  * Indexes of FDW-private information stored in fdw_private lists.
@@ -3563,7 +3564,7 @@ estimate_path_cost_size(PlannerInfo *root,
 	}
 
 	/* Return results. */
-	*p_rows = 1000;
+	*p_rows = 0;
 	*p_width = width;
 	*p_startup_cost = startup_cost;
 	*p_total_cost = total_cost;

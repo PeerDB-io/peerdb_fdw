@@ -325,7 +325,6 @@ typedef struct storeInfo
 	PGresult   *cur_res;
 } storeInfo;
 
-
 /* Callback argument for ec_member_matches_foreign */
 typedef struct
 {
@@ -433,7 +432,7 @@ static void postgresGetForeignUpperPaths(PlannerInfo *root,
 										 UpperRelationKind stage,
 										 RelOptInfo *input_rel,
 										 RelOptInfo *output_rel,
-void *extra);
+										 void *extra);
 static bool postgresIsForeignPathAsyncCapable(ForeignPath *path);
 static void postgresForeignAsyncRequest(AsyncRequest *areq);
 static void postgresForeignAsyncConfigureWait(AsyncRequest *areq);
@@ -447,7 +446,6 @@ static void materializeQueryResult(FunctionCallInfo fcinfo,
 								   PGconn *conn,
 								   const char *sql);
 
-
 /*
  * Helper functions
  */
@@ -455,7 +453,7 @@ static void estimate_path_cost_size(PlannerInfo *root,
 									RelOptInfo *foreignrel,
 									List *param_join_conds,
 									List *pathkeys,
-PgFdwPathExtraData *fpextra,
+									PgFdwPathExtraData *fpextra,
 									double *p_rows, int *p_width,
 									Cost *p_startup_cost, Cost *p_total_cost);
 static void get_remote_estimate(const char *sql,
@@ -5249,7 +5247,7 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 		if (astate->rowstoskip <= 0)
 		{
 			/* Choose a random reservoir element to replace. */
-			pos = (int) (targrows * sampler_random_fract(astate->rstate.randstate));
+			pos = (int) (targrows * sampler_random_fract(&astate->rstate.randstate));
 			Assert(pos >= 0 && pos < targrows);
 			heap_freetuple(astate->rows[pos]);
 		}
@@ -6905,6 +6903,20 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		return;
 
 	/*
+	 * If the query has FETCH FIRST .. WITH TIES, 1) it must have ORDER BY as
+	 * well, which is used to determine which additional rows tie for the last
+	 * place in the result set, and 2) ORDER BY must already have been
+	 * determined to be safe to push down before we get here.  So in that case
+	 * the FETCH clause is safe to push down with ORDER BY if the remote
+	 * server is v13 or later, but if not, the remote query will fail entirely
+	 * for lack of support for it.  Since we do not currently have a way to do
+	 * a remote-version check (without accessing the remote server), disable
+	 * pushing the FETCH clause for now.
+	 */
+	if (parse->limitOption == LIMIT_OPTION_WITH_TIES)
+		return;
+
+	/*
 	 * Also, the LIMIT/OFFSET cannot be pushed down, if their expressions are
 	 * not safe to remote.
 	 */
@@ -7033,14 +7045,16 @@ postgresForeignAsyncConfigureWait(AsyncRequest *areq)
 	{
 		/*
 		 * This is the case when the in-process request was made by another
-		 * Append.  Note that it might be useless to process the request,
-		 * because the query might not need tuples from that Append anymore.
-		 * If there are any child subplans of the same parent that are ready
-		 * for new requests, skip the given request.  Likewise, if there are
-		 * any configured events other than the postmaster death event, skip
-		 * it.  Otherwise, process the in-process request, then begin a fetch
-		 * to configure the event below, because we might otherwise end up
-		 * with no configured events other than the postmaster death event.
+		 * Append.  Note that it might be useless to process the request made
+		 * by that Append, because the query might not need tuples from that
+		 * Append anymore; so we avoid processing it to begin a fetch for the
+		 * given request if possible.  If there are any child subplans of the
+		 * same parent that are ready for new requests, skip the given
+		 * request.  Likewise, if there are any configured events other than
+		 * the postmaster death event, skip it.  Otherwise, process the
+		 * in-process request, then begin a fetch to configure the event
+		 * below, because we might otherwise end up with no configured events
+		 * other than the postmaster death event.
 		 */
 		if (!bms_is_empty(requestor->as_needrequest))
 			return;
@@ -7405,7 +7419,7 @@ make_tuple_from_result_row(PGresult *res,
 		tuple->t_self = tuple->t_data->t_ctid = *ctid;
 
 	/*
-	 * Stomp on the xmin, xmaxand cmin fields from the tuple created by
+	 * Stomp on the xmin, xmax, and cmin fields from the tuple created by
 	 * heap_form_tuple.  heap_form_tuple actually creates the tuple with
 	 * DatumTupleFields, not HeapTupleFields, but the executor expects
 	 * HeapTupleFields and will happily extract system columns on that

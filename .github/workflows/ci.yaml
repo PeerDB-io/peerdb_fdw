@@ -26,7 +26,7 @@ jobs:
           echo "PG_COMMIT_HASH=$(git ls-remote git://git.postgresql.org/git/postgresql.git refs/heads/REL_${PG_VERSION}_STABLE | awk '{print $1}')" >> $GITHUB_ENV
 
       - name: Cache PostgreSQL ${{ env.PG_VERSION }}
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         id: pg-source-cache
         with:
           path: ${{ env.PG_SRC_DIR }}
@@ -40,7 +40,7 @@ jobs:
           ./configure --prefix=$PG_SRC_DIR CFLAGS="-std=gnu99 -ggdb -O0" --enable-cassert
           make install -j$(nproc) > /dev/null
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Build
         id: build
@@ -55,7 +55,7 @@ jobs:
         working-directory: ${{ github.workspace }}/packaging
 
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |

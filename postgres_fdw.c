@@ -312,6 +312,20 @@ typedef struct ConversionLocation
 	ForeignScanState *fsstate;	/* plan node being processed, or NULL */
 } ConversionLocation;
 
+// dblink.c
+typedef struct storeInfo
+{
+	FunctionCallInfo fcinfo;
+	Tuplestorestate *tuplestore;
+	AttInMetadata *attinmeta;
+	MemoryContext tmpcontext;
+	char	  **cstrs;
+	/* temp storage for results to avoid leaks on exception */
+	PGresult   *last_res;
+	PGresult   *cur_res;
+} storeInfo;
+
+
 /* Callback argument for ec_member_matches_foreign */
 typedef struct
 {
@@ -323,6 +337,7 @@ typedef struct
  * SQL functions
  */
 PG_FUNCTION_INFO_V1(postgres_fdw_handler);
+PG_FUNCTION_INFO_V1(peerdb_exec);
 
 /*
  * FDW callback routines
@@ -418,11 +433,20 @@ static void postgresGetForeignUpperPaths(PlannerInfo *root,
 										 UpperRelationKind stage,
 										 RelOptInfo *input_rel,
 										 RelOptInfo *output_rel,
-										 void *extra);
+void *extra);
 static bool postgresIsForeignPathAsyncCapable(ForeignPath *path);
 static void postgresForeignAsyncRequest(AsyncRequest *areq);
 static void postgresForeignAsyncConfigureWait(AsyncRequest *areq);
 static void postgresForeignAsyncNotify(AsyncRequest *areq);
+
+// from dblink.c
+static PGresult *storeQueryResult(volatile storeInfo *sinfo, PGconn *conn, const char *sql);
+static void storeRow(volatile storeInfo *sinfo, PGresult *res, bool first);
+static void prepTuplestoreResult(FunctionCallInfo fcinfo);
+static void materializeQueryResult(FunctionCallInfo fcinfo,
+								   PGconn *conn,
+								   const char *sql);
+
 
 /*
  * Helper functions
@@ -431,7 +455,7 @@ static void estimate_path_cost_size(PlannerInfo *root,
 									RelOptInfo *foreignrel,
 									List *param_join_conds,
 									List *pathkeys,
-									PgFdwPathExtraData *fpextra,
+PgFdwPathExtraData *fpextra,
 									double *p_rows, int *p_width,
 									Cost *p_startup_cost, Cost *p_total_cost);
 static void get_remote_estimate(const char *sql,
@@ -612,6 +636,38 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ForeignAsyncNotify = postgresForeignAsyncNotify;
 
 	PG_RETURN_POINTER(routine);
+}
+
+Datum
+peerdb_exec(PG_FUNCTION_ARGS)
+{
+	PGconn	   *volatile conn = NULL;
+
+	PG_TRY();
+	{
+		if (PG_NARGS() == 2)
+		{
+			char *servername =  text_to_cstring(PG_GETARG_TEXT_PP(0));
+			char *sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
+			ForeignServer *server = GetForeignServerByName(servername, false);
+			UserMapping *mapping = GetUserMapping(GetUserId(), server->serverid);
+			conn = GetConnection(mapping, false, NULL);
+
+			prepTuplestoreResult(fcinfo);
+			materializeQueryResult(fcinfo, conn, sql);
+		}
+		else
+		{
+			elog(ERROR, "peerdb_fdw: wrong number of arguments");
+		}
+	}
+	PG_FINALLY();
+	{
+		if (conn) ReleaseConnection(conn);
+	}
+	PG_END_TRY();
+
+	return (Datum) 0;
 }
 
 /*
@@ -7349,7 +7405,7 @@ make_tuple_from_result_row(PGresult *res,
 		tuple->t_self = tuple->t_data->t_ctid = *ctid;
 
 	/*
-	 * Stomp on the xmin, xmax, and cmin fields from the tuple created by
+	 * Stomp on the xmin, xmaxand cmin fields from the tuple created by
 	 * heap_form_tuple.  heap_form_tuple actually creates the tuple with
 	 * DatumTupleFields, not HeapTupleFields, but the executor expects
 	 * HeapTupleFields and will happily extract system columns on that
@@ -7611,4 +7667,354 @@ get_batch_size_option(Relation rel)
 	}
 
 	return batch_size;
+}
+
+/*
+ * dblink.c
+ *
+ * Functions returning results from a remote database
+ *
+ * Joe Conway <mail@joeconway.com>
+ * And contributors:
+ * Darko Prenosil <Darko.Prenosil@finteh.hr>
+ * Shridhar Daithankar <shridhar_daithankar@persistent.co.in>
+ *
+ * contrib/dblink/dblink.c
+ * Copyright (c) 2001-2021, PostgreSQL Global Development Group
+ * ALL RIGHTS RESERVED;
+ *
+ * Permission to use, copy, modify, and distribute this software and its
+ * documentation for any purpose, without fee, and without a written agreement
+ * is hereby granted, provided that the above copyright notice and this
+ * paragraph and the following two paragraphs appear in all copies.
+ *
+ * IN NO EVENT SHALL THE AUTHOR OR DISTRIBUTORS BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+ * LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
+ * DOCUMENTATION, EVEN IF THE AUTHOR OR DISTRIBUTORS HAVE BEEN ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * THE AUTHOR AND DISTRIBUTORS SPECIFICALLY DISCLAIMS ANY WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE AUTHOR AND DISTRIBUTORS HAS NO OBLIGATIONS TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ */
+
+/*
+ * Execute the given SQL command and store its results into a tuplestore
+ * to be returned as the result of the current function.
+ *
+ * This is equivalent to PQexec followed by materializeResult, but we make
+ * use of libpq's single-row mode to avoid accumulating the whole result
+ * inside libpq before it gets transferred to the tuplestore.
+ */
+static void
+materializeQueryResult(FunctionCallInfo fcinfo,
+					   PGconn *conn,
+					   const char *sql)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	PGresult   *volatile res = NULL;
+	volatile storeInfo sinfo = {0};
+
+	/* prepTuplestoreResult must have been called previously */
+	Assert(rsinfo->returnMode == SFRM_Materialize);
+
+	sinfo.fcinfo = fcinfo;
+
+	PG_TRY();
+	{
+		/* Create short-lived memory context for data conversions */
+		sinfo.tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+												 "dblink temporary context",
+												 ALLOCSET_DEFAULT_SIZES);
+
+		/* execute query, collecting any tuples into the tuplestore */
+		res = storeQueryResult(&sinfo, conn, sql);
+
+		if (!res ||
+			(PQresultStatus(res) != PGRES_COMMAND_OK &&
+			 PQresultStatus(res) != PGRES_TUPLES_OK))
+		{
+			pgfdw_report_error(ERROR, res, conn, false, sql);
+		}
+		else if (PQresultStatus(res) == PGRES_COMMAND_OK)
+		{
+			/*
+			 * storeRow didn't get called, so we need to convert the command
+			 * status string to a tuple manually
+			 */
+			TupleDesc	tupdesc;
+			AttInMetadata *attinmeta;
+			Tuplestorestate *tupstore;
+			HeapTuple	tuple;
+			char	   *values[1];
+			MemoryContext oldcontext;
+
+			/*
+			 * need a tuple descriptor representing one TEXT column to return
+			 * the command status string as our result tuple
+			 */
+			tupdesc = CreateTemplateTupleDesc(1);
+			TupleDescInitEntry(tupdesc, (AttrNumber) 1, "status",
+							   TEXTOID, -1, 0);
+			attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+			oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+			tupstore = tuplestore_begin_heap(true, false, work_mem);
+			rsinfo->setResult = tupstore;
+			rsinfo->setDesc = tupdesc;
+			MemoryContextSwitchTo(oldcontext);
+
+			values[0] = PQcmdStatus(res);
+
+			/* build the tuple and put it into the tuplestore. */
+			tuple = BuildTupleFromCStrings(attinmeta, values);
+			tuplestore_puttuple(tupstore, tuple);
+
+			PQclear(res);
+			res = NULL;
+		}
+		else
+		{
+			Assert(PQresultStatus(res) == PGRES_TUPLES_OK);
+			/* storeRow should have created a tuplestore */
+			Assert(rsinfo->setResult != NULL);
+
+			PQclear(res);
+			res = NULL;
+		}
+
+		/* clean up data conversion short-lived memory context */
+		if (sinfo.tmpcontext != NULL)
+			MemoryContextDelete(sinfo.tmpcontext);
+		sinfo.tmpcontext = NULL;
+
+		PQclear(sinfo.last_res);
+		sinfo.last_res = NULL;
+		PQclear(sinfo.cur_res);
+		sinfo.cur_res = NULL;
+	}
+	PG_CATCH();
+	{
+		/* be sure to release any libpq result we collected */
+		PQclear(res);
+		PQclear(sinfo.last_res);
+		PQclear(sinfo.cur_res);
+		/* and clear out any pending data in libpq */
+		while ((res = PQgetResult(conn)) != NULL)
+			PQclear(res);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Verify function caller can handle a tuplestore result, and set up for that.
+ *
+ * Note: if the caller returns without actually creating a tuplestore, the
+ * executor will treat the function result as an empty set.
+ */
+static void
+prepTuplestoreResult(FunctionCallInfo fcinfo)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	/* check to see if query supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* let the executor know we're sending back a tuplestore */
+	rsinfo->returnMode = SFRM_Materialize;
+
+	/* caller must fill these to return a non-empty result */
+	rsinfo->setResult = NULL;
+	rsinfo->setDesc = NULL;
+}
+
+/*
+ * Execute query, and send any result rows to sinfo->tuplestore.
+ */
+static PGresult *
+storeQueryResult(volatile storeInfo *sinfo, PGconn *conn, const char *sql)
+{
+	bool		first = true;
+	// int			nestlevel = -1;
+	PGresult   *res;
+
+	if (!PQsendQuery(conn, sql))
+		elog(ERROR, "could not send query: %s", pchomp(PQerrorMessage(conn)));
+
+	if (!PQsetSingleRowMode(conn))	/* shouldn't fail */
+		elog(ERROR, "failed to set single-row mode for dblink query");
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		sinfo->cur_res = PQgetResult(conn);
+		if (!sinfo->cur_res)
+			break;
+
+		if (PQresultStatus(sinfo->cur_res) == PGRES_SINGLE_TUPLE)
+		{
+			/* got one row from possibly-bigger resultset */
+
+			/*
+			 * Set GUCs to ensure we read GUC-sensitive data types correctly.
+			 * We shouldn't do this until we have a row in hand, to ensure
+			 * libpq has seen any earlier ParameterStatus protocol messages.
+			 */
+			// PEERDB: disable, peerdb doesn't really do GUCs
+			// if (first && nestlevel < 0)
+			//	nestlevel = applyRemoteGucs(conn);
+
+			storeRow(sinfo, sinfo->cur_res, first);
+
+			PQclear(sinfo->cur_res);
+			sinfo->cur_res = NULL;
+			first = false;
+		}
+		else
+		{
+			/* if empty resultset, fill tuplestore header */
+			if (first && PQresultStatus(sinfo->cur_res) == PGRES_TUPLES_OK)
+				storeRow(sinfo, sinfo->cur_res, first);
+
+			/* store completed result at last_res */
+			PQclear(sinfo->last_res);
+			sinfo->last_res = sinfo->cur_res;
+			sinfo->cur_res = NULL;
+			first = true;
+		}
+	}
+
+	/* clean up GUC settings, if we changed any */
+	// PEERDB: disabled
+	// restoreLocalGucs(nestlevel);
+
+	/* return last_res */
+	res = sinfo->last_res;
+	sinfo->last_res = NULL;
+	return res;
+}
+
+/*
+ * Send single row to sinfo->tuplestore.
+ *
+ * If "first" is true, create the tuplestore using PGresult's metadata
+ * (in this case the PGresult might contain either zero or one row).
+ */
+static void
+storeRow(volatile storeInfo *sinfo, PGresult *res, bool first)
+{
+	int			nfields = PQnfields(res);
+	HeapTuple	tuple;
+	int			i;
+	MemoryContext oldcontext;
+
+	if (first)
+	{
+		/* Prepare for new result set */
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *) sinfo->fcinfo->resultinfo;
+		TupleDesc	tupdesc;
+
+		/*
+		 * It's possible to get more than one result set if the query string
+		 * contained multiple SQL commands.  In that case, we follow PQexec's
+		 * traditional behavior of throwing away all but the last result.
+		 */
+		if (sinfo->tuplestore)
+			tuplestore_end(sinfo->tuplestore);
+		sinfo->tuplestore = NULL;
+
+		/* get a tuple descriptor for our result type */
+		switch (get_call_result_type(sinfo->fcinfo, NULL, &tupdesc))
+		{
+			case TYPEFUNC_COMPOSITE:
+				/* success */
+				break;
+			case TYPEFUNC_RECORD:
+				/* failed to determine actual type of RECORD */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("function returning record called in context "
+								"that cannot accept type record")));
+				break;
+			default:
+				/* result type isn't composite */
+				elog(ERROR, "return type must be a row type");
+				break;
+		}
+
+		/* make sure we have a persistent copy of the tupdesc */
+		tupdesc = CreateTupleDescCopy(tupdesc);
+
+		/* check result and tuple descriptor have the same number of columns */
+		if (nfields != tupdesc->natts)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("remote query result rowtype does not match "
+							"the specified FROM clause rowtype")));
+
+		/* Prepare attinmeta for later data conversions */
+		sinfo->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+		/* Create a new, empty tuplestore */
+		oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+		sinfo->tuplestore = tuplestore_begin_heap(true, false, work_mem);
+		rsinfo->setResult = sinfo->tuplestore;
+		rsinfo->setDesc = tupdesc;
+		MemoryContextSwitchTo(oldcontext);
+
+		/* Done if empty resultset */
+		if (PQntuples(res) == 0)
+			return;
+
+		/*
+		 * Set up sufficiently-wide string pointers array; this won't change
+		 * in size so it's easy to preallocate.
+		 */
+		if (sinfo->cstrs)
+			pfree(sinfo->cstrs);
+		sinfo->cstrs = (char **) palloc(nfields * sizeof(char *));
+	}
+
+	/* Should have a single-row result if we get here */
+	Assert(PQntuples(res) == 1);
+
+	/*
+	 * Do the following work in a temp context that we reset after each tuple.
+	 * This cleans up not only the data we have direct access to, but any
+	 * cruft the I/O functions might leak.
+	 */
+	oldcontext = MemoryContextSwitchTo(sinfo->tmpcontext);
+
+	/*
+	 * Fill cstrs with null-terminated strings of column values.
+	 */
+	for (i = 0; i < nfields; i++)
+	{
+		if (PQgetisnull(res, 0, i))
+			sinfo->cstrs[i] = NULL;
+		else
+			sinfo->cstrs[i] = PQgetvalue(res, 0, i);
+	}
+
+	/* Convert row to a tuple, and add it to the tuplestore */
+	tuple = BuildTupleFromCStrings(sinfo->attinmeta, sinfo->cstrs);
+
+	tuplestore_puttuple(sinfo->tuplestore, tuple);
+
+	/* Clean up */
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextReset(sinfo->tmpcontext);
 }

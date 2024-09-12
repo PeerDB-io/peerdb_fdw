@@ -60,7 +60,7 @@ PG_MODULE_MAGIC;
 #define DEFAULT_FDW_TUPLE_COST		0.01
 
 /* If no remote estimates, assume a sort costs 20% extra */
-#define DEFAULT_FDW_SORT_MULTIPLIER 1.2
+#define DEFAULT_FDW_SORT_MULTIPLIER 1.01
 
 /* bigquery sort multiplier. See: https://github.com/PeerDB-io/nexus/issues/264 */
 #define BIGQUERY_FDW_SORT_MULTIPLIER 0.8
@@ -3620,7 +3620,7 @@ estimate_path_cost_size(PlannerInfo *root,
 	}
 
 	/* Return results. */
-	*p_rows = rows;
+	*p_rows = 0;
 	*p_width = width;
 	*p_startup_cost = startup_cost;
 	*p_total_cost = total_cost;

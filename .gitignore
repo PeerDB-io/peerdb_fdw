@@ -37,6 +37,7 @@ lib*.pc
 /config.cache
 /config.log
 /config.status
+/packaging
 /pgsql.sln
 /pgsql.sln.cache
 /Debug/
